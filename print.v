@@ -19,8 +19,6 @@ reg [7:0] ascii_reg;
 
 assign ascii = (binary ? 8'd49 : 8'd48);
 
-end
-
 endmodule
 
 

@@ -54,6 +54,7 @@
 !*.sof
 !*.md
 !*.txt
+!tools/
 ## tbd
 
 !*.tcl

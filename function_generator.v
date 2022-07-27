@@ -129,43 +129,65 @@ input 		     [1:0]		gpio1_IN;
 //=======================================================
 
 /* UART STUFF */
-parameter STRING_BUF_SIZE = 80; // 80 characters is the width of a standard terminal
+parameter STRING_BUF_SIZE = 64; // 64 is the default size of the UART buffers
 reg [STRING_BUF_SIZE*8-1:0] uart_tx_buf;
 wire [STRING_BUF_SIZE*8-1:0] uart_rx_buf; // whatever we receive from the uart
 wire [15:0] rx_size;
 wire rx_buf_full;
 wire tx_done;
 reg [15:0] tx_size;
-reg tx_reset;
+reg tx_go = 'b0;
 reg rx_reset;
+reg ftdi_reset;
+reg rts_reg = 'b1;
+parameter BEGIN_UART_PACKET = 8'h55; // four of these symbols indicates the START of the uart packet
+parameter END_UART_PACKET 	= 8'hAA; // four of these symbols indicates the END of the uart packet
+parameter WAVEFORM_TYPE_IND = 32;
+parameter GAIN_SETTING_IND 	= WAVEFORM_TYPE_IND + 8;
+parameter OFFSET_IND 		= GAIN_SETTING_IND + 8;
+parameter AMP_IND 			= OFFSET_IND + 8;
+parameter FREQ_IND 			= AMP_IND + 32;
+parameter FREQ_CLK_DIV_IND 	= FREQ_IND + 32;
+parameter END_IND 			= FREQ_CLK_DIV_IND + 32;
+parameter UART_PACK_SIZE 	= (END_IND + 32) >> 3; // size of the packet in bytes (octets)
+
 
 /* SWITCH STUFF */
-wire [3:0] sw_states;
+wire [3:0] sw_state;
 reg [3:0] led_states;
 
 /* ENCODER STUFF */
+reg signed [31:0] last_freq_enc_counts = 'b0;
 wire [31:0] freq_enc_counts;
 wire [31:0] freq_enc_period;
 wire freq_enc_dir;
 reg freq_enc_reset;
+reg signed [31:0] last_amp_enc_counts = 'b0;
 wire [31:0] amp_enc_counts;
 wire [31:0] amp_enc_period;
 wire amp_enc_dir;
 reg amp_enc_reset;
-reg amp_offset_toggle;
+reg amp_offset_toggle = 'b0;
 
 /* HMC960 VGA and SPI STUFF */
 wire [31:0] hmc960_rx_data;
-reg [31:0] hmc960_clk_div;
+reg [31:0] hmc960_clk_div = 50;
 reg [31:0] hmc960_tx_data;
 wire hmc960_cs;
-reg spi_begin;
-reg spi_reset;
+reg spi_xfer_in_progress = 'b0;
+reg spi_begin_trig = 'b0;
+wire spi_begin;// = 'b0;
+reg spi_reset = 'b0;
+wire update_gain;
+reg last_update_gain = 'b0;
+reg [31:0] update_gain_rate = 1000000; // 50 times per second
 parameter 	HMC960_STATE_INIT_REG_1 = 0,
 			HMC960_STATE_INIT_REG_2 = 1,
 			HMC960_STATE_SET_GAIN 	= 2,
-			HMC960_STATE_IDLE 		= 3;
-reg [2:0] hmc960_state = HMC960_STATE_IDLE;
+			HMC960_STATE_IDLE 		= 3,
+			HMC960_STATE_ALMOST_DONE = 4,
+			HMC960_STATE_SETUP_DONE = 5;
+reg [2:0] hmc960_state;
 
 /* GENERAL FUNCTION GEN STUFF */
 parameter 	WAVEFORM_OFF 	= 0,
@@ -175,16 +197,20 @@ parameter 	WAVEFORM_OFF 	= 0,
 			WAVEFORM_ARB 	= 4;
 
 /* MAIN STATE MACHINE */
+wire main_clk;
 parameter 	STATE_STARTUP 	= 0,
-			STATE_RUN 		= 1;
-parameter 	STARTUP_DELAY 	= 1024;
-reg [2:0] waveform_select = WAVEFORM_OFF;
-reg [2:0] func_gen_state = STATE_STARTUP;
+			STATE_INIT_VGA 	= 1,
+			STATE_RUN 		= 2;
+parameter 	STARTUP_DELAY 	= 20000; // time enough for ensuring the HMC960 can do its POR 
+parameter   HEARTBEAT_CLK_DIV = 50000000;
+reg [31:0] heartbeat_div = HEARTBEAT_CLK_DIV;
+reg [2:0] waveform_select;
+reg [2:0] func_gen_state;
 reg [31:0] func_gen_clk_div = 32'h98;
 reg [7:0] gain_setting = 0;
 reg [7:0] last_gain_setting = 0;
-reg [15:0] startup_counter = 0;
-reg [8:0] duty_cycle;
+reg [23:0] startup_counter = 0;
+reg [8:0] duty_cycle = 255;
 wire [7:0] sine_word;
 wire [7:0] tri_word;
 wire [7:0] sqr_word;
@@ -194,10 +220,18 @@ reg [7:0] offset = 8'd128;
 //=======================================================
 //  Structural coding
 //=======================================================
+/* HEARTBEAT */
+divider HEARTBEAT_CLK_DIVIDER(gpio0[11], CLOCK_50, heartbeat_div);
+
+/* MAIN STATE MACHINE CLOCK */
+// divider MAIN_CLK(main_clk, CLOCK_50, main_clk_div);
+
 /* UART STUFF */
 // GPIO_00 is FPGA TX, pipe data from UART out to GPIO_00
 // GPIO_01 is FPGA RX, pipe data into UART from GPIO_01
-uart UART_BLOCK(uart_rx_buf, rx_size, rx_buf_full, tx_done, rx_state, gpio0[0], gpio0[1], rx_reset, CLOCK_50, uart_tx_buf, tx_size, tx_reset);
+uart UART_BLOCK(uart_rx_buf, rx_size, rx_buf_full, tx_done, rx_state, gpio0[0], gpio0[1], rx_reset, CLOCK_50, uart_tx_buf, tx_size, tx_go);
+assign gpio0[2] = ftdi_reset;
+assign gpio0[3] = rts_reg;
 
 /* Switch debouncing */
 debounce DEBOUNCER_SW_A(sw_state[0], CLOCK_50, gpio0[10]);
@@ -206,9 +240,9 @@ debounce DEBOUNCER_SW_C(sw_state[2], CLOCK_50, gpio0[14]);
 debounce DEBOUNCER_SW_D(sw_state[3], CLOCK_50, gpio0[16]);
 
 /* LED assignments */
-assign gpio0[11] = led_states[0];
-assign gpio0[13] = led_states[1];
-assign gpio0[15] = led_states[2];
+// assign gpio0[11] = led_states[0];
+assign gpio0[13] = spi_begin;
+assign gpio0[15] = spi_begin_trig;
 assign gpio0[17] = led_states[3];
 assign gpio1[15] = hmc960_cs;
 
@@ -217,6 +251,8 @@ encoder FREQ_ENC(freq_enc_counts, freq_enc_period, freq_enc_dir, CLOCK_50, gpio0
 encoder AMP_ENC(amp_enc_counts, amp_enc_period, amp_enc_dir, CLOCK_50, gpio0[8], gpio0[9], amp_enc_reset);
 
 /* SPI STUFF */
+pulse_gen #(.PULSE_WIDTH(100)) SPI_BEGIN_PULSE_GEN(spi_begin, CLOCK_50, spi_begin_trig);
+divider UPDATE_GAIN_CLK_DIV(update_gain, CLOCK_50, update_gain_rate);
 hmc960 HMC960_CTL(hmc960_rx_data, gpio1[16], gpio1[17], hmc960_cs, gpio1[18], CLOCK_50, hmc960_clk_div, hmc960_tx_data, spi_begin, spi_reset);
 
 /* FUNCTION GENERATION STUFF */
@@ -224,7 +260,7 @@ sine_wave SINE_GENERATOR(sine_word, CLOCK_50, func_gen_clk_div);
 triangle_wave TRIANGLE_GENERATOR(tri_word, CLOCK_50, func_gen_clk_div);
 square_wave #(.DUTY_CYCLE_BITS(9)) SQUARE_GENERATOR(sqr_word, CLOCK_50, func_gen_clk_div, duty_cycle);
 
-assign gpio0[9:2] = (	waveform_select == WAVEFORM_SINE ? sine_word : 
+assign gpio1[7:0] = (	waveform_select == WAVEFORM_SINE ? sine_word : 
 						(waveform_select == WAVEFORM_TRI ? tri_word : 
 						(waveform_select == WAVEFORM_SQR ? sqr_word : 
 						(waveform_select == WAVEFORM_ARB ? arb_word : 8'h00))));
@@ -236,74 +272,108 @@ always @(posedge CLOCK_50) begin
 	case (func_gen_state)
 		STATE_STARTUP: begin
 			startup_counter <= startup_counter + 1;
+			// startup counter monitoring
 			if(startup_counter < (STARTUP_DELAY >> 1)) begin
 				// Assert reset signals
+				// heartbeat_div <= HEARTBEAT_CLK_DIV;
+				led_states[3] <= 'b0;
 				spi_reset <= 'b1;
+				spi_begin_trig <= 'b0;
 				freq_enc_reset <= 'b1;
 				amp_enc_reset <= 'b1;
-				tx_reset <= 'b1;
 				rx_reset <= 'b1;
-				hmc960_state <= HMC960_STATE_IDLE;
+				hmc960_state <= HMC960_STATE_INIT_REG_1;
+				ftdi_reset <= 'b0; // low means RESET for FT232RL
+				rts_reg <= 'b1; // we're just gonna keep this HIGH (deasserted)
 			end else if(startup_counter < STARTUP_DELAY) begin
 				// deassert reset signals
 				spi_reset <= 'b0;
 				freq_enc_reset <= 'b0;
 				amp_enc_reset <= 'b0;
-				tx_reset <= 'b0;
 				rx_reset <= 'b0;
-				hmc960_state <= HMC960_STATE_INIT_1; // to begin setup on next clock cycle
-				
+				// hmc960_state <= HMC960_STATE_INIT_REG_1; // to begin setup on next clock cycle
+				ftdi_reset <= 'b1;
 			end else begin
-				// STARTUP_DELAY counts have elapsed, but need to check if HMC960 is all set up
-				if (!spi_begin && hmc960_cs && hmc960_state == HMC960_STATE_IDLE) begin
-					func_gen_state <= STATE_RUN; // finally enter run state
-				end
+				func_gen_state <= STATE_INIT_VGA; // finally enter run state
 			end
-
-			if (!spi_reset && !spi_begin && hmc960_cs) begin
-				// spi is not in reset, spi_begin is deasserted, and spi xfer is not in progress (done)
+		end
+		STATE_INIT_VGA: begin
+			// HMC960 specific setup
+			if (!spi_begin && !spi_begin_trig && hmc960_cs) begin
+				// spi is not in reset, spi_begin is deasserted, and spi xfer is not in progress (done or idle)
 				// so we can run through the setup state machine
 				case (hmc960_state)
-					HMC960_STATE_IDLE: begin // do nothing
-					end
 					HMC960_STATE_INIT_REG_1: begin
 						hmc960_tx_data[31:8] <= 24'b10; // enable Q channel, disable I channel
 						hmc960_tx_data[7:0] <= {5'h1, 3'b110}; // address reg 1, chip id = 110b
-						spi_begin <= 'b1; // send spi_begin high
+						spi_begin_trig <= 'b1; // send spi_begin high
 						hmc960_state <= HMC960_STATE_INIT_REG_2; // goto next state
 					end
 					HMC960_STATE_INIT_REG_2: begin
-						hmc960_tx_data[31:8] <= 24'b00111001; // 
+						// gain ctrl deglitching, 
+						// Decoded gain, 
+						// SPI gain ctrl, 
+						// Rin=50, 
+						// recommended drvr bias, 
+						// opamp bias set for low freq
+						hmc960_tx_data[31:8] <= 24'b00111001; 
 						hmc960_tx_data[7:0] <= {5'h2, 3'b110}; // address reg 2, chip id = 110b
-						spi_begin <= 'b1; // send spi_begin high
-						hmc960_state <= HMC960_STATE_IDLE; // next we'll set initial gain
+						spi_begin_trig <= 'b1; // send spi_begin high
+						hmc960_state <= HMC960_STATE_SET_GAIN; // next we'll set initial gain
 					end
 					HMC960_STATE_SET_GAIN: begin
 						// TODO read last gain from EEPROM
-						hmc960_tx_data[31:8] <= 24'b0; // 0dB gain
+						hmc960_tx_data[31:8] <= 24'h50; // max gain instead of 0dB gain
 						hmc960_tx_data[7:0] <= {5'h3, 3'b110}; // address reg 3, chip id = 110b
-						spi_begin <= 'b1; // send spi_begin high
-						hmc960_state <= HMC960_STATE_IDLE; // done with setup, goto IDLE
+						spi_begin_trig <= 'b1; // send spi_begin high
+						hmc960_state <= HMC960_STATE_SETUP_DONE; // done with setup, goto DONE state
+					end
+					HMC960_STATE_SETUP_DONE: begin
+						func_gen_state <= STATE_RUN;
 					end
 					default: begin
-						hmc960_state <= HMC960_STATE_IDLE;
+						hmc960_state <= HMC960_STATE_INIT_REG_1;
 					end
 				endcase
-			end else if (!hmc960_cs) begin
-				// spi is in progress, so we can reset spi_begin
-				spi_begin <= 'b0;
+			end else if (!spi_begin && !hmc960_cs && spi_begin_trig) begin
+				// reset the pulse trigger right after spi_begin gies LOW
+				// this gives us a clock cycle for the spi controller to assert chip select
+				spi_begin_trig <= 'b0;
 			end
 		end
 		STATE_RUN: begin
-			if(!spi_begin && hmc960_cs) begin
-				if(last_gain_setting != gain_setting) begin
-					hmc960_tx_data[14:8] <= gain_setting[6:0]; // 0dB gain
-					hmc960_tx_data[7:0] <= {5'h3, 3'b110}; // address reg 3, chip id = 110b
-					spi_begin <= 'b1; // send spi_begin high
-				end
-				last_gain_setting <= gain_setting;
-			end else if(!hmc960_cs) begin
-				spi_begin <= 'b0;
+			
+			led_states[3] <= sw_state[3];
+
+			// SPI TRANSACTION WITH THE HMC960
+			if(last_gain_setting != gain_setting && hmc960_cs) begin
+				hmc960_tx_data[14:8] <= gain_setting[6:0]; //
+				hmc960_tx_data[7:0] <= {5'h3, 3'b110}; // address reg 3, chip id = 110b
+				spi_begin_trig <= 'b1; // send spi_begin high
+			end else if(spi_begin_trig) begin
+				spi_begin_trig <= 'b0;
+			end
+			last_gain_setting <= gain_setting;
+
+			// SEND OUT DATA OVER UART
+			if(tx_done && !tx_go) begin
+				// package data
+				uart_tx_buf[WAVEFORM_TYPE_IND-1:0] <= {BEGIN_UART_PACKET, BEGIN_UART_PACKET, BEGIN_UART_PACKET, BEGIN_UART_PACKET};
+				// uart_tx_buf[WAVEFORM_TYPE_IND+31:WAVEFORM_TYPE_IND] <= 32'hDEADBEEF;
+				uart_tx_buf[WAVEFORM_TYPE_IND+7:WAVEFORM_TYPE_IND] <= {5'h0, waveform_select};
+				uart_tx_buf[GAIN_SETTING_IND+7:GAIN_SETTING_IND] <= gain_setting;
+				uart_tx_buf[OFFSET_IND+7:OFFSET_IND] <= offset;
+				uart_tx_buf[AMP_IND+31:AMP_IND] <= amp_enc_counts;
+				uart_tx_buf[FREQ_IND+31:FREQ_IND] <= freq_enc_counts;
+				uart_tx_buf[FREQ_CLK_DIV_IND+31:FREQ_CLK_DIV_IND] <= func_gen_clk_div;
+				uart_tx_buf[END_IND+31:END_IND] <= {END_UART_PACKET, END_UART_PACKET, END_UART_PACKET, END_UART_PACKET};
+				tx_size <= UART_PACK_SIZE;
+				// uart_tx_buf[WAVEFORM_TYPE_IND+63:WAVEFORM_TYPE_IND+32] <= {END_UART_PACKET, END_UART_PACKET, END_UART_PACKET, END_UART_PACKET};
+				// tx_size <= 12;
+				tx_go <= 'b1;
+			end else begin
+				// ensure that tx_go is de-asserted
+				tx_go <= 'b0;
 			end
 			
 		end
@@ -313,59 +383,26 @@ always @(posedge CLOCK_50) begin
 	endcase
 end
 
-/* CHANGE FREQUENCY */
-always @(freq_enc_counts) begin
-	// increment or decrement based on period
-	// long period indicates small increment
-	// small period indicates big increment
-
-	if (freq_enc_period > 25000000) begin // greater than 500ms
-		if (freq_enc_dir) begin
-			func_gen_clk_div <= func_gen_clk_div - 1;
-		end else begin
-			func_gen_clk_div <= func_gen_clk_div + 1;
-		end
-	end else if (freq_enc_period > 5000000) begin // 100ms < period < 500ms
-		if (freq_enc_dir) begin
-			func_gen_clk_div <= func_gen_clk_div - 5;
-		end else begin
-			func_gen_clk_div <= func_gen_clk_div + 5;
-		end
-	end else if (freq_enc_period > 1000000) begin // 20ms < period < 100ms
-		if (freq_enc_dir) begin
-			func_gen_clk_div <= func_gen_clk_div - 10;
-		end else begin
-			func_gen_clk_div <= func_gen_clk_div + 10;
-		end
-	end else begin // anything less than 20ms
-		if (freq_enc_dir) begin
-			func_gen_clk_div <= func_gen_clk_div - 25;
-		end else begin
-			func_gen_clk_div <= func_gen_clk_div + 25;
-		end
-	end
-	
-end
 
 /* function for changing gain and making sure it doesn't exceed the limits */
 function [7:0] change_gain;
-	input signed [7:0] gain;
-	input signed [7:0] delta;
+	input [7:0] gain;
+	input [7:0] delta;
 	input dir;
 	begin
 		if (dir) begin
 			// decrement
-			if ((gain - delta) >= 0) begin
+			if (delta <= gain) begin
 				change_gain = gain - delta;
 			end else begin
 				change_gain = 0;
 			end
 		end else begin
 			// increment
-			if ((gain + delta) <= 80) begin
+			if ((gain + delta) <= 8'h50) begin
 				change_gain = gain + delta;
 			end else begin
-				change_gain = 8'd80;
+				change_gain = 8'h50;
 			end
 		end
 	end
@@ -374,49 +411,87 @@ endfunction
 /* function for changing offset making sure it doesn't exceed the limits */
 function [7:0] change_offset;
 	input [7:0] offset;
-	input signed [7:0] delta;
+	input [7:0] delta;
+	input dir;
 	begin
-		if (delta < 0) begin
-			if ((offset + delta) > offset) begin
+		if (!dir) begin
+			// subtract
+			if (delta <= offset) begin
+				change_offset = offset - delta;
+			end else begin
 				change_offset = 0;
 			end
 		end else begin
-			if ((offset + delta) < offset) begin
-				change_offset = 255;
+			// add
+			if (offset < 255 - delta) begin
+				change_offset = offset + delta;
 			end
 		end
 	end
 endfunction
 
 /* CHANGE AMPLITUDE */
-always @(amp_enc_counts) begin
+always @(posedge CLOCK_50) begin
 	// increment or decrement based on period
 	// long period indicates small increment
 	// small period indicates big increment
-	if(!amp_offset_toggle) begin
-		if (amp_enc_period > 25000000) begin // greater than 500ms
-			gain_setting <= change_gain(gain_setting, 1, amp_enc_dir);
-		end else if (amp_enc_period > 5000000) begin // 100ms < period < 500ms
-			gain_setting <= change_gain(gain_setting, 2, amp_enc_dir);
-		end else if (amp_enc_period > 1000000) begin // 20ms < period < 100ms
-			gain_setting <= change_gain(gain_setting, 3, amp_enc_dir);
-		end else begin // anything less than 20ms
-			gain_setting <= change_gain(gain_setting, 4, amp_enc_dir);
-		end
-	end else begin
-		// change offset instead
-		if (amp_enc_period > 25000000) begin // greater than 500ms
-			offset <= change_offset(offset, 1);
-		end else if (amp_enc_period > 5000000) begin // 100ms < period < 500ms
-			offset <= change_offset(offset, 2);
-		end else if (amp_enc_period > 1000000) begin // 20ms < period < 100ms
-			offset <= change_offset(offset, 4);
-		end else begin // anything less than 20ms
-			offset <= change_offset(offset, 8);
+	if(amp_enc_counts != last_amp_enc_counts) begin
+		if(!amp_offset_toggle) begin
+			if (amp_enc_period > 25000000) begin // greater than 500ms
+				gain_setting <= change_gain(gain_setting, 1, amp_enc_dir);
+			end else if (amp_enc_period > 5000000) begin // 100ms < period < 500ms
+				gain_setting <= change_gain(gain_setting, 2, amp_enc_dir);
+			end else if (amp_enc_period > 1000000) begin // 20ms < period < 100ms
+				gain_setting <= change_gain(gain_setting, 3, amp_enc_dir);
+			end else begin // anything less than 20ms
+				gain_setting <= change_gain(gain_setting, 4, amp_enc_dir);
+			end
+		end else begin
+			// change offset instead
+			if (amp_enc_period > 25000000) begin // greater than 500ms
+				offset <= change_offset(offset, 1, amp_enc_dir);
+			end else if (amp_enc_period > 5000000) begin // 100ms < period < 500ms
+				offset <= change_offset(offset, 2, amp_enc_dir);
+			end else if (amp_enc_period > 1000000) begin // 20ms < period < 100ms
+				offset <= change_offset(offset, 3, amp_enc_dir);
+			end else begin // anything less than 20ms
+				offset <= change_offset(offset, 4, amp_enc_dir);
+			end
 		end
 	end
+	last_amp_enc_counts <= amp_enc_counts;
+
+	if (freq_enc_counts != last_freq_enc_counts) begin
+		if (freq_enc_period > 25000000) begin // greater than 500ms
+			if (freq_enc_dir) begin
+				func_gen_clk_div <= func_gen_clk_div - 1;
+			end else begin
+				func_gen_clk_div <= func_gen_clk_div + 1;
+			end
+		end else if (freq_enc_period > 5000000) begin // 100ms < period < 500ms
+			if (freq_enc_dir) begin
+				func_gen_clk_div <= func_gen_clk_div - 5;
+			end else begin
+				func_gen_clk_div <= func_gen_clk_div + 5;
+			end
+		end else if (freq_enc_period > 1000000) begin // 20ms < period < 100ms
+			if (freq_enc_dir) begin
+				func_gen_clk_div <= func_gen_clk_div - 10;
+			end else begin
+				func_gen_clk_div <= func_gen_clk_div + 10;
+			end
+		end else begin // anything less than 20ms
+			if (freq_enc_dir) begin
+				func_gen_clk_div <= func_gen_clk_div - 25;
+			end else begin
+				func_gen_clk_div <= func_gen_clk_div + 25;
+			end
+		end
+	end
+	last_freq_enc_counts <= freq_enc_counts;
 end
 
+/* AMPLITUDE ADJ OR OFFSET ADJUST TOGGLE */
 always @(negedge sw_state[3]) begin
 	amp_offset_toggle <= ~amp_offset_toggle;
 end
@@ -424,14 +499,12 @@ end
 /* WAVEFORM SELECT BUTTON */
 always @(negedge sw_state[0]) begin
 	// waveform select button
-	if (!sw_state[0]) begin
-		if ((waveform_select == WAVEFORM_ARB) begin
-			// advance to state 0
-			waveform_select <= 0;
-		end else begin
-			// advance to next state
-			waveform_select <= waveform_select + 1;
-		end
+	if (waveform_select == WAVEFORM_ARB) begin
+		// advance to state 0
+		waveform_select <= 0;
+	end else begin
+		// advance to next state
+		waveform_select <= waveform_select + 1;
 	end
 end
 
